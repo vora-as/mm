@@ -427,22 +427,12 @@ class _BillListState extends State<BillList> {
             });
 
             if (task == 'UPI QR') {
-              try {
-                Logger.d("DEBUG: UPI QR flow started for Bill ID: $billno");
-                print("Settlement Drawer: UPI QR selected for bill $billno, amount $amount");
-                FlutterMosambeeAar.initialise(_username, _password);
-                FlutterMosambeeAar.setInternalUi(false);
-                FlutterMosambeeAar.generateUPIQR(amount, "UPI QR");
-                print("Settlement Drawer: Mosambee UPI QR generation started.");
-                _listenUPIPayment(context, billno, amount);
+              print("Settlement Drawer: UPI QR selected for bill $billno, amount $amount");
+              performTransaction('UPI QR', amount, false);
+              return true;
+            }
 
-                return true;
-              } catch (e, stack) {
-                Logger.e("Failed in UPI QR flow: $e\n$stack");
-                ToastUtils.showErrorToast("Failed in UPI QR: $e");
-                return false;
-              }
-            } else if (task == 'Card') {
+            else if (task == 'Card') {
               print("Settlement Drawer: Card selected for bill $billno, amount $amount");
               performTransaction('SALE', amount, false);
             } else if (task == 'xx') {
@@ -458,101 +448,7 @@ class _BillListState extends State<BillList> {
     );
   }
 
-  void _listenUPIPayment(BuildContext context, String billno, double amount) {
-    StreamSubscription? resultSub;
-    String? upiTransactionId;
-    bool qrShown = false;
-    bool pollingStarted = false;
 
-    resultSub = FlutterMosambeeAar.onResult.listen((resultData) {
-      final body = json.decode(resultData.transactionData ?? "{}");
-      Logger.d("UPI QR onResult: ${resultData.toMap()}");
-
-      // QR generated - show QR, then IMMEDIATELY start polling
-      if (!qrShown &&
-          resultData.result == true &&
-          (body["message"] != null && body["message"].toString().toLowerCase().contains("upi"))) {
-        upiTransactionId = resultData.transactionId;
-        Logger.d("UPI QR generated, transactionId: $upiTransactionId");
-        print("UPI QR: QR generated and shown to user, transactionId: $upiTransactionId, amount: $amount");
-        QRDialog.showQRDialog(context, "UPI QR", body["message"] ?? "Scan UPI QR", "AMOUNT: $amount");
-        qrShown = true;
-
-        if (upiTransactionId != null && upiTransactionId!.isNotEmpty && !pollingStarted) {
-          pollingStarted = true;
-          print("UPI QR: Starting BharatQR polling for transactionId: $upiTransactionId");
-          _pollBharatQRStatus(context, billno, upiTransactionId!, amount, resultSub);
-        } else {
-          print("UPI QR: Polling not started. upiTransactionId is null or empty.");
-        }
-        return;
-      }
-
-      // Payment failure
-      if (resultData.result == false) {
-        print("UPI QR: Payment failed or cancelled for bill $billno, reason: ${resultData.reason}");
-        ToastUtils.showErrorToast(resultData.reason ?? "Payment failed or cancelled.");
-        if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
-        resultSub?.cancel();
-        currentTask = ""; // Reset current task
-        return;
-      }
-    });
-  }
-
-  void _pollBharatQRStatus(BuildContext context, String billno, String transactionId, double amount, StreamSubscription? resultSub) {
-    int maxAttempts = 12;
-    int attempts = 0;
-    bool settled = false;
-
-    print("Polling function entered for transactionId: $transactionId");
-    Timer.periodic(Duration(seconds: 5), (Timer timer) async {
-      attempts++;
-      print("Polling attempt #$attempts for BharatQR with transactionId: $transactionId");
-      Logger.d("Polling Bharat QR Status, attempt $attempts, transactionId: $transactionId");
-
-      FlutterMosambeeAar.checkBharatQRStatus(
-        amount,
-        DateFormat('yyyy-MM-dd').format(DateTime.now()),
-        "Bharat QR Status Check",
-        transactionId,
-      );
-
-      // Listen ONCE for the result.
-      StreamSubscription? pollSub;
-      pollSub = FlutterMosambeeAar.onResult.listen((resultData) async {
-        final body = json.decode(resultData.transactionData ?? "{}");
-        Logger.d("BharatQR Status result: ${resultData.toMap()}");
-
-        // Check for payment success
-        if (resultData.result == true &&
-            body["result"] == "Success" &&
-            body["transactionId"] == transactionId) {
-          Logger.d("BharatQR payment success for $transactionId");
-          print("BharatQR payment SUCCESS at attempt #$attempts for transactionId: $transactionId");
-          timer.cancel();
-          settled = true;
-          if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
-          await _updateSettlementMode(billno, "UPI QR");
-          ToastUtils.showNormalToast("Payment successful!");
-          // Cancel all listeners
-          pollSub?.cancel();
-          resultSub?.cancel();
-          // Reset currentTask
-          currentTask = "";
-        } else if (attempts >= maxAttempts) {
-          timer.cancel();
-          print("Polling ended after $attempts attempts (max $maxAttempts reached) for transactionId: $transactionId");
-          if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
-          ToastUtils.showErrorToast("Payment not completed in time.");
-          pollSub?.cancel();
-          resultSub?.cancel();
-          // Reset currentTask
-          currentTask = "";
-        }
-      });
-    });
-  }
   Future<void> _updateSettlementMode(String billId, String settlementMode) async {
     String settlementTime = DateTime.now().toIso8601String();
     print("SETTLE BY $settlementMode");
@@ -773,46 +669,57 @@ class _BillListState extends State<BillList> {
 
   Future<void> _listenTransactionData(String billno) async {
     FlutterMosambeeAar.onResult.listen((resultData) async {
-      Logger.d(" =========== Result data is ============ ${resultData.toMap()}");
-      final body = json.decode(resultData.transactionData ?? "{}");
+      if (resultData.result != null && resultData.result == true) {
+        final body = json.decode(resultData.transactionData ?? "{}");
 
-      // SHOW QR when currentTask is UPI QR and result is true, and not a payment success yet
-      if (currentTask == "UPI QR" && resultData.result == true) {
-        // This shows the QR dialog with the QR content/message from Mosambee
-        QRDialog.showQRDialog(context, currentTask, body["message"], "AMOUNT : ${body["amount"] ?? resultData.amount}");
+        _transactionId = resultData.transactionId ?? "";
+        Logger.d("DEBUG: Stored Transaction ID: $_transactionId");
 
-        // Do NOT return here: payment success may come in a later event
-      }
-
-      // Handle payment success (settle, print, etc.) - "Success" from Mosambee
-      if (body["result"] == "Success" &&
-          body["transactionId"] != "NA" &&
-          body["transactionId"] != "00") {
-        Logger.d("Payment Success for transaction: ${body['transactionId']}");
-        _transactionId = body["transactionId"];
-        _transactionAmount = body["amount"];
-        _transactionData = body;
-
-        // close QR dialog if open
-        if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
-
-        // Now call your settlement/update logic
-        if (billno != null && billno.isNotEmpty) {
-          await _updateSettlementMode(billno, "UPI QR");
+        if (!QRDialog.isDialogOpen()) {
+          QRDialog.showQRDialog(context, currentTask, body["message"],
+              "AMOUNT : ${resultData.amount ?? body["amount"]}");
         }
 
-        // Optionally, print receipt
-        printReceipt(resultData.transactionData ?? "");
-      }
+        Logger.d(
+            "DEBUG: ✅ Successfully stored Transaction ID: $_transactionId");
 
-      // Handle payment failure
-      if (resultData.result != true) {
-        ToastUtils.showErrorToast(resultData.reason ?? "Payment failed");
-        if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
+        // ✅ Directly update settlement when UPI is successful
+
+        if (currentTask == "UPI QR") {
+          if (billno != null && billno.isNotEmpty) {
+            Logger.d("DEBUG: Updating settlement for Bill ID: $billno");
+            _updateSettlementMode(
+                billNoValue, "UPI QR"); // ✅ Now updates correctly
+          } else {
+            Logger.d("ERROR: Missing Bill ID for settlement update!");
+          }
+        } else {
+          _transactionId = body["transactionId"] ?? "";
+          _transactionAmount = body["amount"] ?? "";
+          _transactionData = body;
+
+          handleSuccessResponse(resultData.transactionData ?? "", currentTask);
+
+          // ✅ REMOVE _updateSettlementMode for Card here.
+          // It will now happen inside onPrintFinish after printing.
+        }
+
+        checkBharatQRStatusRepeatedly(context, billNoValue);  // Still needed for confirmation checks
+      } else {
+        ToastUtils.showErrorToast(resultData.reason ?? "");
       }
     });
 
-    // ... (onCommand logic as before)
+    FlutterMosambeeAar.onCommand.listen((command) {
+      Logger.d("Command data is $command");
+      ToastUtils.showNormalToast(command);
+      if (command != "Signature Required.") {
+        getAndroidBuildModel().then((String model) {
+          if (model == "D20" && command.contains("Enter PIN")) {
+          } else {}
+        });
+      } else {}
+    });
   }
 ////
   void checkBharatQRStatusRepeatedly(BuildContext context, String billId) {
@@ -848,7 +755,7 @@ class _BillListState extends State<BillList> {
           Future.delayed(Duration(seconds: 3), () {
             QRDialog.closeDialog();
             isSuccess = true;
-            // Use the provided billId parameter instead of hardcoding
+
             _updateSettlementMode(billId, "UPI QR"); // Removed extra space
           });
         } else if (attempts >= maxAttempts) {
@@ -861,7 +768,6 @@ class _BillListState extends State<BillList> {
       });
     });
   }
-
   Future<void> _listenPrinter() async {
     FlutterMosambeeAar.onPrintStart.listen((onPrintStart) async {
       ToastUtils.showNormalToast(onPrintStart);
@@ -1095,7 +1001,7 @@ class _BillListState extends State<BillList> {
       if (currentTask == "GENERATE BQR" ||
           currentTask == "BQR CHECK STATUS" ||
           currentTask == "UPI CHECK STATUS" ||
-          currentTask == "UPI Online" ||
+          currentTask == "UPI QR" ||
           currentTask == "PRINT RECEIPT" ||
           currentTask == "CARD TRANSACTION HISTORY" ||
           currentTask == "NON CARD TRANSACTION HISTORY" ||
@@ -1122,7 +1028,7 @@ class _BillListState extends State<BillList> {
   void performTransaction(String task, double amount, bool isCardNumberCall) {
     FlutterMosambeeAar.initialise(_username, _password);
 
-    if (task == 'UPI Online') {
+    if (task == 'UPI QR') {
       FlutterMosambeeAar.generateUPIQR(amount, "Test");
       FlutterScannerAar.initialise();
       FlutterScannerAar.setWorkMode(0);
@@ -2447,59 +2353,21 @@ class _BillListState extends State<BillList> {
   }
 
   void closeWindowAndPrintReceipt(String transactionData) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        Future.delayed(const Duration(seconds: 3), () {
-          Navigator.of(context).pop();
-
-          if (MediaQuery.of(context).size.width >
-              MediaQuery.of(context).size.height) {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(
-                builder: (context) => const MainMenuDesk(),
-              ),
-            );
-          } else {
-            Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(
-                builder: (context) => const MainMenu(),
-              ),
-            );
-          }
-        });
-
-        return AlertDialog(
-          backgroundColor: Colors.white.withOpacity(0.7),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              const Icon(
-                Icons.check_circle,
-                size: 48.0,
-                color: Colors.green,
-              ),
-              const SizedBox(height: 16.0),
-              Text(
-                'Transaction Successful\nPrinting Receipt...',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.blue.shade800,
-                  fontSize: 18.0,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-
     printReceipt(transactionData);
+
+    FlutterMosambeeAar.onPrintFinish.listen((onPrintFinish) {
+      ToastUtils.showNormalToast(onPrintFinish);
+      Logger.d("✅ Receipt print finished. Proceeding to settlement update.");
+
+      // ✅ Settlement update only happens here
+      if (currentTask == "Card" || currentTask == "SALE") {
+        _updateSettlementMode(billNoValue, "Card");
+      }
+
+      FlutterMosambeeAar.closePrinter();
+    });
   }
+
 
   Future<void> showSuccessDialog(BuildContext context, String billNo) async {
     return showDialog(
@@ -3193,7 +3061,7 @@ class GridItem extends StatelessWidget {
                   Future.delayed(const Duration(seconds: 3), () {
                     Navigator.of(context).pop();
 
-                    if (screenWidth > screenHeight) {
+                   /* if (screenWidth > screenHeight) {
                       Navigator.pushReplacement(
                         context,
                         MaterialPageRoute(
@@ -3207,7 +3075,7 @@ class GridItem extends StatelessWidget {
                           builder: (context) => const MainMenu(),
                         ),
                       );
-                    }
+                    }*/
                   });
 
                   return AlertDialog(
