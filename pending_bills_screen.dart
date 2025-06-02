@@ -429,9 +429,11 @@ class _BillListState extends State<BillList> {
             if (task == 'UPI QR') {
               try {
                 Logger.d("DEBUG: UPI QR flow started for Bill ID: $billno");
+                print("Settlement Drawer: UPI QR selected for bill $billno, amount $amount");
                 FlutterMosambeeAar.initialise(_username, _password);
                 FlutterMosambeeAar.setInternalUi(false);
                 FlutterMosambeeAar.generateUPIQR(amount, "UPI QR");
+                print("Settlement Drawer: Mosambee UPI QR generation started.");
                 _listenUPIPayment(context, billno, amount);
 
                 return true;
@@ -441,8 +443,10 @@ class _BillListState extends State<BillList> {
                 return false;
               }
             } else if (task == 'Card') {
+              print("Settlement Drawer: Card selected for bill $billno, amount $amount");
               performTransaction('SALE', amount, false);
             } else if (task == 'xx') {
+              print("Settlement Drawer: Cash settlement dialog opening for bill $billno, amount $amount");
               _showCashSettlementDialog(context, billno, amount);
             } else {
               //await _updateSettlementMode(billno, task);
@@ -464,43 +468,47 @@ class _BillListState extends State<BillList> {
       final body = json.decode(resultData.transactionData ?? "{}");
       Logger.d("UPI QR onResult: ${resultData.toMap()}");
 
-      // 1. Show QR to user when generated (first resultData.result == true and has message)
+      // QR generated - show QR, then IMMEDIATELY start polling
       if (!qrShown &&
           resultData.result == true &&
           (body["message"] != null && body["message"].toString().toLowerCase().contains("upi"))) {
         upiTransactionId = resultData.transactionId;
         Logger.d("UPI QR generated, transactionId: $upiTransactionId");
+        print("UPI QR: QR generated and shown to user, transactionId: $upiTransactionId, amount: $amount");
         QRDialog.showQRDialog(context, "UPI QR", body["message"] ?? "Scan UPI QR", "AMOUNT: $amount");
         qrShown = true;
-        return; // Don't settle yet!
+
+        if (upiTransactionId != null && upiTransactionId!.isNotEmpty && !pollingStarted) {
+          pollingStarted = true;
+          print("UPI QR: Starting BharatQR polling for transactionId: $upiTransactionId");
+          _pollBharatQRStatus(context, billno, upiTransactionId!, amount, resultSub);
+        } else {
+          print("UPI QR: Polling not started. upiTransactionId is null or empty.");
+        }
+        return;
       }
 
-      // 2. Payment attempt/failures (show error)
+      // Payment failure
       if (resultData.result == false) {
+        print("UPI QR: Payment failed or cancelled for bill $billno, reason: ${resultData.reason}");
         ToastUtils.showErrorToast(resultData.reason ?? "Payment failed or cancelled.");
         if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
         resultSub?.cancel();
         currentTask = ""; // Reset current task
         return;
       }
-
-      // 3. If QR is shown and we have a transactionId, start polling BharatQR status
-      if (qrShown && upiTransactionId != null && !pollingStarted) {
-        pollingStarted = true;
-        _pollBharatQRStatus(context, billno, upiTransactionId!, amount, resultSub);
-      }
     });
   }
-
 
   void _pollBharatQRStatus(BuildContext context, String billno, String transactionId, double amount, StreamSubscription? resultSub) {
     int maxAttempts = 12;
     int attempts = 0;
     bool settled = false;
 
+    print("Polling function entered for transactionId: $transactionId");
     Timer.periodic(Duration(seconds: 5), (Timer timer) async {
       attempts++;
-      print("Polling attempt #$attempts for BharatQR with transactionId: $transactionId"); // <-- Added print statement
+      print("Polling attempt #$attempts for BharatQR with transactionId: $transactionId");
       Logger.d("Polling Bharat QR Status, attempt $attempts, transactionId: $transactionId");
 
       FlutterMosambeeAar.checkBharatQRStatus(
@@ -521,6 +529,7 @@ class _BillListState extends State<BillList> {
             body["result"] == "Success" &&
             body["transactionId"] == transactionId) {
           Logger.d("BharatQR payment success for $transactionId");
+          print("BharatQR payment SUCCESS at attempt #$attempts for transactionId: $transactionId");
           timer.cancel();
           settled = true;
           if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
@@ -533,6 +542,7 @@ class _BillListState extends State<BillList> {
           currentTask = "";
         } else if (attempts >= maxAttempts) {
           timer.cancel();
+          print("Polling ended after $attempts attempts (max $maxAttempts reached) for transactionId: $transactionId");
           if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
           ToastUtils.showErrorToast("Payment not completed in time.");
           pollSub?.cancel();
@@ -543,8 +553,6 @@ class _BillListState extends State<BillList> {
       });
     });
   }
-
-
   Future<void> _updateSettlementMode(String billId, String settlementMode) async {
     String settlementTime = DateTime.now().toIso8601String();
     print("SETTLE BY $settlementMode");
