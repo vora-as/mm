@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'ConstantUtils.dart';
@@ -650,7 +651,7 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
 
     requestPermission();
 
-    _listenTransactionData();
+    _listenTransactionData(context);
     _listenPrinter();
   }
 
@@ -665,89 +666,132 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
     ].request();
   }
 
-  Future<void> _listenTransactionData() async {
-    FlutterMosambeeAar.onResult.listen((resultData) async {
-      Logger.d(
-          " =========== Result data is ============ ${resultData.toMap()}");
+  Timer? _statusCheckTimer;
+  String? _pendingQrTxnId;
+  Future<void> _listenTransactionData(BuildContext context) async {
+    void startPaymentStatusPolling(String transactionId) {
+      int attempts = 0;
+      int maxAttempts = 12;
+      bool isSuccess = false;
 
-      if (resultData.result != null && resultData.result == true) {
-        //Logger.d(resultData.transactionData ?? "");
+      Logger.d("DEBUG: Starting polling for transaction: $transactionId");
 
-        final body = json.decode(resultData.transactionData ?? "{}");
-
-        if (currentTask == "CASH" || currentTask == "CHEQUE") {
-          printReceiptWithTransactionId("${body['transactionId']}");
-        } else {
-          if (body["result"] != null &&
-              body["result"] == "success" &&
-              body["transactionId"] != "NA" &&
-              body["transactionId"] != "00") {
-            printReceipt(resultData.transactionData ?? "");
-          } else {
-            if (resultData.reasonCode == "MD14") {
-              Logger.d("Duplicate Transaction");
-            } else {
-              Logger.d("Transaction Failed");
+      _statusCheckTimer?.cancel();
+      _statusCheckTimer = Timer.periodic(Duration(seconds: 5), (timer) {
+        if (isSuccess || attempts >= maxAttempts) {
+          timer.cancel();
+          if (!isSuccess) {
+            Logger.d("⏱️ Polling timed out for transaction: $transactionId");
+            try {
+              if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
+            } catch (e) {
+              Logger.d("❌ Error closing dialog: $e");
             }
           }
+          return;
         }
-      } else {
-        ToastUtils.showErrorToast(resultData.reason ?? "");
-      }
 
-      try {
-        if (QRDialog.isDialogOpen()) {
-          QRDialog.closeDialog();
-        }
-      } catch (e) {
-        Logger.d("Exception in QR Dialog::::$e");
-      }
+        attempts++;
+        Logger.d("🔁 Polling attempt $attempts for transactionId: $transactionId");
+        print("🔁 Polling attempt $attempts for transactionId: $transactionId");
+        FlutterMosambeeAar.checkBharatQRStatus(1.00, "2025-01-24", "test", transactionId);
+      });
 
-      if (resultData.result != null && resultData.result == true) {
+      // Listen for result while polling
+      FlutterMosambeeAar.onResult.listen((resultData) {
         final body = json.decode(resultData.transactionData ?? "{}");
-        if (currentTask == "GENERATE BQR" || currentTask == "UPI QR") {
-          if (currentTask == "GENERATE BQR") {
-            QRDialog.showQRDialog(context, currentTask, body["message"],
-                "AMOUNT : ${body["amount"]}");
-          } else if (currentTask == "UPI QR") {
-            QRDialog.showQRDialog(context, currentTask, body["message"],
-                "AMOUNT : ${resultData.amount}");
-          } else {
-            QRDialog.showQRDialog(context, currentTask, body["message"], "");
+        final txnIdFromResult = resultData.transactionId ?? body["transactionId"];
+
+        if ((txnIdFromResult == transactionId) && body["result"]?.toLowerCase() == "success") {
+          Logger.d("✅ Polling SUCCESS for transaction: $transactionId");
+          isSuccess = true;
+          _statusCheckTimer?.cancel();
+
+          try {
+            if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
+          } catch (e) {
+            Logger.d("Error closing dialog after success: $e");
           }
-        } else {
-          _transactionId = body["transactionId"] ?? "";
-          _transactionAmount = body["amount"] ?? "";
-          _transactionData = body;
-          handleSuccessResponse(resultData.transactionData ?? "", currentTask);
+
+          // Proceed after payment success
+          printReceiptWithTransactionId(transactionId);
         }
-      } else {
-        _transactionReason = resultData.reason ?? "";
-        _transactionReasonCode = resultData.reasonCode ?? "";
-        _task =
-        "Transaction Failed\n$_transactionReasonCode\n$_transactionReason";
-        performActions(_task);
+      });
+    }
+
+    FlutterMosambeeAar.onResult.listen((resultData) async {
+      Logger.d("📥 Received result: ${resultData.toMap()}");
+
+      final body = json.decode(resultData.transactionData ?? "{}");
+      final txnId = resultData.transactionId ?? body["transactionId"] ?? "";
+
+      // Show QR and start polling
+      if ((currentTask == "GENERATE BQR" || currentTask == "UPI QR") &&
+          resultData.result == true &&
+          body["message"] != null &&
+          body["transType"] == "UPI_QR") {
+
+        Logger.d("🧾 QR generated. Transaction ID: $txnId");
+        _pendingQrTxnId = txnId;
+        _transactionId = txnId;
+
+        QRDialog.showQRDialog(
+            context,
+            currentTask,
+            body["message"],
+            "AMOUNT : ${resultData.amount ?? body["amount"]}"
+        );
+
+        startPaymentStatusPolling(txnId);
+        return;
+      }
+
+      // Final success response
+      if ((currentTask == "GENERATE BQR" || currentTask == "UPI QR") &&
+          _pendingQrTxnId != null &&
+          txnId == _pendingQrTxnId &&
+          body["result"]?.toLowerCase() == "success") {
+
+        Logger.d("✅ Final UPI QR payment SUCCESS for $_pendingQrTxnId");
+        _statusCheckTimer?.cancel();
+        _pendingQrTxnId = null;
+
+        try {
+          if (QRDialog.isDialogOpen()) QRDialog.closeDialog();
+        } catch (e) {
+          Logger.d("QR dialog close exception: $e");
+        }
+
+        printReceiptWithTransactionId(txnId);
+        return;
+      }
+
+      // Failure fallback
+      if (resultData.result == true && body["result"]?.toLowerCase() != "success") {
+        Logger.d("❌ Transaction reported failed.");
+      } else if (resultData.result == false) {
+        ToastUtils.showErrorToast(resultData.reason ?? "Transaction failed");
       }
     });
 
     FlutterMosambeeAar.onCommand.listen((command) {
-      Logger.d("Command data is $command");
+      Logger.d("ℹ️ Command: $command");
       ToastUtils.showNormalToast(command);
       if (command != "Signature Required.") {
-        getAndroidBuildModel().then((String model) {
+        getAndroidBuildModel().then((model) {
           if (model == "D20" && command.contains("Enter PIN")) {
-          } else {}
+            // PIN entry handling if required
+          }
         });
-      } else {}
+      }
     });
 
     FlutterScannerAar.onScanResult.listen((result) {
-      Logger.d(
-          " ===========ScanResult Result data is ============ ${result.toMap()}");
-
+      Logger.d("🔍 ScanResult: ${result.toMap()}");
       ToastUtils.showErrorToast(result.toMap().toString());
     });
   }
+
 
   Future<void> _listenPrinter() async {
     FlutterMosambeeAar.onPrintStart.listen((onPrintStart) async {
@@ -5375,107 +5419,107 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
               ),
               content:SingleChildScrollView(
                 child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // Mobile No. Field
-                  SizedBox(
-                    height: 50,
-                    child: TextField(
-                      controller: mobileController,
-                      keyboardType: TextInputType.number,
-                      onChanged: (value) {
-                        Customer? foundCustomer = customers.firstWhere(
-                              (customer) => customer.contactNo.toString().startsWith(value),
-                          orElse: () => Customer(customerCode: '', customerName: '', contactNo: 0, gstNo: '', address: ''),
-                        );
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Mobile No. Field
+                    SizedBox(
+                      height: 50,
+                      child: TextField(
+                        controller: mobileController,
+                        keyboardType: TextInputType.number,
+                        onChanged: (value) {
+                          Customer? foundCustomer = customers.firstWhere(
+                                (customer) => customer.contactNo.toString().startsWith(value),
+                            orElse: () => Customer(customerCode: '', customerName: '', contactNo: 0, gstNo: '', address: ''),
+                          );
 
-                        if (foundCustomer.customerName.isNotEmpty) {
-                          nameController.text = foundCustomer.customerName;
-                          gstController.text = foundCustomer.gstNo;
-                          addressController.text = foundCustomer.address;
-                        } else {
-                          nameController.clear();
-                          gstController.clear();
-                          addressController.clear();
+                          if (foundCustomer.customerName.isNotEmpty) {
+                            nameController.text = foundCustomer.customerName;
+                            gstController.text = foundCustomer.gstNo;
+                            addressController.text = foundCustomer.address;
+                          } else {
+                            nameController.clear();
+                            gstController.clear();
+                            addressController.clear();
+                          }
+                        },
+                        decoration: const InputDecoration(labelText: 'Mobile No.', border: OutlineInputBorder()),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    Autocomplete<Customer>(
+                      optionsBuilder: (TextEditingValue textEditingValue) {
+                        if (textEditingValue.text.isEmpty) {
+                          return const Iterable<Customer>.empty();
                         }
+                        return customers.where((customer) =>
+                            customer.customerName.toLowerCase().contains(textEditingValue.text.toLowerCase()));
                       },
-                      decoration: const InputDecoration(labelText: 'Mobile No.', border: OutlineInputBorder()),
+                      displayStringForOption: (Customer option) => option.customerName,
+                      onSelected: (Customer selectedCustomer) {
+                        nameController.text = selectedCustomer.customerName;
+                        mobileController.text = selectedCustomer.contactNo.toString();
+                        gstController.text = selectedCustomer.gstNo;
+                        addressController.text = selectedCustomer.address;
+                      },
+                      fieldViewBuilder: (context, controller, focusNode, onEditingComplete) {
+                        controller.text = nameController.text;
+                        return SizedBox(
+                          height: 50,
+                          child: TextField(
+                            controller: controller,
+                            focusNode: focusNode,
+                            onEditingComplete: onEditingComplete,
+                            decoration: const InputDecoration(labelText: 'Name', border: OutlineInputBorder()),
+                          ),
+                        );
+                      },
+
                     ),
-                  ),
-                  const SizedBox(height: 20),
-
-                  Autocomplete<Customer>(
-                    optionsBuilder: (TextEditingValue textEditingValue) {
-                      if (textEditingValue.text.isEmpty) {
-                        return const Iterable<Customer>.empty();
-                      }
-                      return customers.where((customer) =>
-                          customer.customerName.toLowerCase().contains(textEditingValue.text.toLowerCase()));
-                    },
-                    displayStringForOption: (Customer option) => option.customerName,
-                    onSelected: (Customer selectedCustomer) {
-                      nameController.text = selectedCustomer.customerName;
-                      mobileController.text = selectedCustomer.contactNo.toString();
-                      gstController.text = selectedCustomer.gstNo;
-                      addressController.text = selectedCustomer.address;
-                    },
-                    fieldViewBuilder: (context, controller, focusNode, onEditingComplete) {
-                      controller.text = nameController.text;
-                      return SizedBox(
-                        height: 50,
-                        child: TextField(
-                          controller: controller,
-                          focusNode: focusNode,
-                          onEditingComplete: onEditingComplete,
-                          decoration: const InputDecoration(labelText: 'Name', border: OutlineInputBorder()),
-                        ),
-                      );
-                    },
-
-                  ),
-                  const SizedBox(height: 20),
-                  SizedBox(
-                    height: 50,
-                    child: TextField(
-                      controller: gstController,
-                      decoration: const InputDecoration(labelText: 'GST NO', border: OutlineInputBorder()),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      height: 50,
+                      child: TextField(
+                        controller: gstController,
+                        decoration: const InputDecoration(labelText: 'GST NO', border: OutlineInputBorder()),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 20),
-                  SizedBox(
-                    height: 50,
-                    child: TextField(
-                      controller: addressController,
-                      decoration: const InputDecoration(labelText: 'Address', border: OutlineInputBorder()),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      height: 50,
+                      child: TextField(
+                        controller: addressController,
+                        decoration: const InputDecoration(labelText: 'Address', border: OutlineInputBorder()),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 20),
-                  ElevatedButton(
-                    onPressed: () {
-                      _showAddCustomerForm(context, (newName, newContact, newGst) {
-                        Navigator.pop(context); // Close current dialog
-                        showCustomerDialog(context, prefillMobile: newContact, prefillName: newName, prefillGst: newGst);
-                      });
-                    },
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
-                    child: const Text('Create New Customer', style: TextStyle(color: Colors.white)),
-                  ),
-                  const SizedBox(height: 20),
+                    const SizedBox(height: 20),
+                    ElevatedButton(
+                      onPressed: () {
+                        _showAddCustomerForm(context, (newName, newContact, newGst) {
+                          Navigator.pop(context); // Close current dialog
+                          showCustomerDialog(context, prefillMobile: newContact, prefillName: newName, prefillGst: newGst);
+                        });
+                      },
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+                      child: const Text('Create New Customer', style: TextStyle(color: Colors.white)),
+                    ),
+                    const SizedBox(height: 20),
 
-                  ElevatedButton(
-                    style: ElevatedButton.styleFrom(backgroundColor: Color(0xFFD5282A)),
-                    onPressed: () {
-                      custmobile = mobileController.text;
-                      custname = nameController.text;
-                      custgst = gstController.text;
-                      customerAddress = addressController.text;
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(backgroundColor: Color(0xFFD5282A)),
+                      onPressed: () {
+                        custmobile = mobileController.text;
+                        custname = nameController.text;
+                        custgst = gstController.text;
+                        customerAddress = addressController.text;
 
-                      Navigator.of(context).pop();
-                    },
-                    child: const Text('Done', style: TextStyle(color: Colors.white, fontSize: 15)),
-                  ),
-                ],
-              ),),
+                        Navigator.of(context).pop();
+                      },
+                      child: const Text('Done', style: TextStyle(color: Colors.white, fontSize: 15)),
+                    ),
+                  ],
+                ),),
               actions: [
                 TextButton(
                   onPressed: () => Navigator.of(context).pop(),
@@ -5555,7 +5599,7 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
                 const SizedBox(height: 10.0),
 
                 // Table Name Text
-                 Text(
+                Text(
                   Lastclickedmodule == 'Dine'
                       ? 'Table ${tableinfo['name']!}'
                       : capitalizeWords(tableinfo['name']!),
@@ -6392,7 +6436,7 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
                                   ],
                                 ),
 
-                             /* if (homeDeliveryCharge != 0)
+                              /* if (homeDeliveryCharge != 0)
                                 Row(
                                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                   children: [
@@ -6866,7 +6910,7 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
     }
     if (
 
-        Lastclickedmodule == "Counter" ||
+    Lastclickedmodule == "Counter" ||
         Lastclickedmodule == "Online") {
       statuss = "Y";
     }
@@ -7395,8 +7439,7 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
       List<SelectedProduct> selectedProductss,
       List<SelectedProductModifier> selectedModifiers,
       Map<String, String> tableinfoo,
-      )
-      async {
+      ) async {
     double screenWidth = MediaQuery.of(context).size.width;
     double screenHeight = MediaQuery.of(context).size.height;
 
@@ -7439,7 +7482,6 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
                           if (title == 'Cash') {
                             postData(context, selectedProductss, selectedModifiers, tableinfoo);
                           } else if (title == 'Card') {
-                            postData(context, selectedProductss, selectedModifiers, tableinfoo);
                             _username = "9920593222";
                             _password = "3241";
                             currentTask = "SALE";
@@ -7449,10 +7491,10 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
                               if (resultData.result == true) {
                                 final body = json.decode(resultData.transactionData ?? "{}");
 
-                                if (body["result"] == "Success" &&
-                                    body["transactionId"] != "NA") {
+                                if (body["result"] == "Success" && body["transactionId"] != "NA") {
                                   printReceipt(resultData.transactionData ?? "");
                                   ToastUtils.showSuccessToast("Transaction successful and receipt printed.");
+                                  postData(context, selectedProductss, selectedModifiers, tableinfoo); // ✅ Only on success
                                 } else {
                                   ToastUtils.showErrorToast("Transaction failed.");
                                 }
@@ -7463,16 +7505,33 @@ class _GenerateBillscreenState extends State<GenerateBillscreen> {
 
                             performActions("getAmount");
                           } else if (title == 'UPI QR' || title == 'UPI') {
-                            postData(context, selectedProductss, selectedModifiers, tableinfoo);
                             _username = "9920593222";
                             _password = "3241";
                             currentTask = "UPI QR";
                             _task = "getAmount";
+
+                            FlutterMosambeeAar.onResult.listen((resultData) async {
+                              if (resultData.result == true) {
+                                final body = json.decode(resultData.transactionData ?? "{}");
+
+                                if (body["result"] == "Success" && body["transactionId"] != "NA") {
+                                  ToastUtils.showSuccessToast("UPI transaction successful.");
+                                  postData(context, selectedProductss, selectedModifiers, tableinfoo); // ✅ Only on success
+                                } else {
+                                  ToastUtils.showErrorToast("UPI transaction failed.");
+                                }
+                              } else {
+                                ToastUtils.showErrorToast("Transaction error: ${resultData.reason}");
+                              }
+                            });
+
                             performActions("getAmount");
                           } else {
+                            // Default behavior for other settlement types
                             postData(context, selectedProductss, selectedModifiers, tableinfoo);
                           }
                         },
+
                         child: Card(
                           elevation: 0.0,
                           shape: RoundedRectangleBorder(
@@ -7674,3 +7733,6 @@ class GridItem extends StatelessWidget {
     );
   }
 }
+
+
+
